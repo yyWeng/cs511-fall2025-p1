@@ -173,7 +173,7 @@ fi
 
 echo -n "Testing Tera Sorting ..."
 test_terasorting > out/test_terasorting.out 2>&1
-if diff --strip-trailing-cr resources/example-terasorting.truth <(test_terasorting); then
+if diff --strip-trailing-cr resources/example-terasorting.truth out/test_terasorting.out; then
     echo -e " ${GREEN}PASS${NC}"
     (( total_score+=20 ));
 else
@@ -182,7 +182,7 @@ fi
 
 echo -n "Testing PageRank (extra credit) ..."
 test_pagerank > out/test_pagerank.out 2>&1
-if diff --strip-trailing-cr resources/example-pagerank.truth <(test_pagerank); then
+if diff --strip-trailing-cr resources/example-pagerank.truth out/test_pagerank.out; then
     echo -e " ${GREEN}PASS${NC}"
     (( total_score+=20 ));
 else
