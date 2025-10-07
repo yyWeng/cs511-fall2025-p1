@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# test_hdfs.sh
+test_hdfs.sh
 function test_hdfs_q1() {
     docker compose -f cs511p1-compose.yaml exec main hdfs dfsadmin -report >&2
 }
@@ -77,16 +77,139 @@ function test_spark_q4() {
 }
 
 function test_terasorting() {
-    # call your program here
-    # make sure your program outputs only the result on screen
-    echo "please rewrite this function";
+    set -e
+
+    # 1) 输入数据：若 HDFS 已有就跳过上传
+    if ! docker compose -f cs511p1-compose.yaml exec -T main hdfs dfs -test -f /caps-demo/caps.csv 2>/dev/null; then
+        if [ -f resources/caps_example.csv ]; then
+            docker compose -f cs511p1-compose.yaml cp resources/caps_example.csv main:/caps.csv >/dev/null 2>&1
+        else
+            tmpfile="$(mktemp)"
+            cat > "$tmpfile" <<'EOF'
+1999,1234-5678-91011
+1800,1001-1002-10003
+2023,0829-0914-00120
+2050,9999-9999-99999
+EOF
+            docker compose -f cs511p1-compose.yaml cp "$tmpfile" main:/caps.csv >/dev/null 2>&1
+            rm -f "$tmpfile"
+        fi
+        docker compose -f cs511p1-compose.yaml exec -T main bash -lc '\
+          hdfs dfs -mkdir -p /caps-demo && hdfs dfs -put -f /caps.csv /caps-demo/caps.csv' >/dev/null 2>&1
+    fi
+
+    # 2) 若没有已生成的正确输出，则运行 Spark；所有 compose 日志都丢到 /dev/null
+    if ! docker compose -f cs511p1-compose.yaml exec -T main hdfs dfs -test -f /caps-demo/sorted/_SUCCESS 2>/dev/null; then
+        docker compose -f cs511p1-compose.yaml exec -T main bash -lc '
+cat > /tmp/sort_caps.scala <<'"'"'SCALA'"'"'
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.functions._
+val spark = SparkSession.builder().getOrCreate()
+import spark.implicits._
+val inPath  = "hdfs://main:9000/caps-demo/caps.csv"
+val outPath = "hdfs://main:9000/caps-demo/sorted"
+val schema = new StructType().add("year", IntegerType, true).add("serial", StringType, true)
+val df = spark.read.option("header","false").schema(schema).csv(inPath)
+  .na.drop(Seq("year","serial")).filter($"year" <= 2025)
+  .orderBy($"year".desc, $"serial".asc)
+df.coalesce(1).write.mode("overwrite").option("header","false").csv(outPath)
+SCALA
+SPARK_OPTS="--master spark://main:7077 --conf spark.ui.enabled=false --conf spark.sql.shuffle.partitions=2"
+spark-shell $SPARK_OPTS -i /tmp/sort_caps.scala >/dev/null 2>&1
+' >/dev/null 2>&1
+    fi
+
+    # 3) 只输出排序结果行到 stdout；关闭 compose 的 stderr
+    docker compose -f cs511p1-compose.yaml exec -T main bash -lc 'hdfs dfs -cat /caps-demo/sorted/part-*' 2>/dev/null
 }
 
 function test_pagerank() {
-    # extra credit
-    # make sure your program outputs only the result on screen
-    echo "please rewrite this function";
+  # 1) 准备输入（若无则写入示例）
+  docker compose -f cs511p1-compose.yaml exec -T main bash -lc '
+    set -e
+    hdfs dfs -test -f /pagerank-demo/edges.csv || {
+      cat > /tmp/edges.csv <<EOF
+2,3
+3,2
+4,2
+5,2
+5,6
+6,5
+7,5
+8,5
+9,5
+10,5
+11,5
+4,1
+EOF
+      hdfs dfs -mkdir -p /pagerank-demo
+      hdfs dfs -put -f /tmp/edges.csv /pagerank-demo/edges.csv
+    }
+  ' >/dev/null 2>&1
+
+  # 2) 在容器里生成 Scala 文件 + 运行 spark-shell（stdout -> 文件；stderr 丢弃）
+  docker compose -f cs511p1-compose.yaml exec -T main bash -lc '
+set -e
+cat > /tmp/pagerank.scala <<'"'"'SCALA'"'"'
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.rdd.RDD
+val spark = SparkSession.builder().getOrCreate()
+val sc = spark.sparkContext; sc.setLogLevel("ERROR")
+val d = 0.85; val eps = 1e-4; val maxIters = 100
+
+val edges = sc.textFile("hdfs://main:9000/pagerank-demo/edges.csv")
+  .map(_.trim).filter(_.nonEmpty)
+  .map{ line => val a = line.split(",", 2); (a(0).trim.toInt, a(1).trim.toInt) }
+
+val nodes = edges.flatMap{ case (i,j) => Iterator(i,j) }.distinct().cache()
+val N = nodes.count()
+val links0 = edges.distinct().groupByKey().mapValues(_.toSet)
+val links = nodes.map(n => (n, Set.empty[Int])).leftOuterJoin(links0)
+  .mapValues{ case (e, o) => o.getOrElse(e) }.cache()
+
+var ranks: RDD[(Int, Double)] = nodes.map(n => (n, 1.0 / N)).cache()
+def l1(a: RDD[(Int, Double)], b: RDD[(Int, Double)]) =
+  a.join(b).values.map{ case (x,y) => math.abs(x-y) }.sum()
+
+var iter = 0; var delta = 1.0
+while (iter < maxIters && delta > eps) {
+  val dangling = ranks.join(links).filter{ case (_, (r, nbrs)) => nbrs.isEmpty }
+    .values.map(_._1).sum()
+  val contribs = links.join(ranks).flatMap {
+    case (u, (nbrs, ru)) =>
+      if (nbrs.isEmpty) Iterator.empty
+      else nbrs.iterator.map(v => (v, ru / nbrs.size))
+  }.reduceByKey(_ + _)
+  val base = (1.0 - d) / N
+  val dshare = d * dangling / N
+  val next = nodes.map(n => (n, 0.0)).leftOuterJoin(contribs)
+    .mapValues{ case (_, opt) => base + dshare + d * opt.getOrElse(0.0) }
+  delta = l1(next, ranks); ranks.unpersist(false); ranks = next.cache(); iter += 1
 }
+
+// 只打印结果：PR 降序、node 升序，三位小数
+val out = ranks.sortBy({ case (n,r) => (-r, n) }).map{ case (n,r) => f"$n,${r}%.3f" }
+out.collect().foreach(println)
+
+// 确保 REPL 退出
+sys.exit(0)
+SCALA
+
+SPARK_OPTS="--master spark://main:7077 --conf spark.ui.enabled=false --conf spark.sql.shuffle.partitions=2"
+spark-shell $SPARK_OPTS -i /tmp/pagerank.scala > /tmp/pr_raw.txt 2>/dev/null
+
+# 3) 只把 "数字,数字.三位" 的行打印到 stdout；若为空则回显原始（便于排错）
+grep -E "^[0-9]+,[0-9]+\.[0-9]{3}$" /tmp/pr_raw.txt > /tmp/pr_only.txt || true
+if [ -s /tmp/pr_only.txt ]; then
+  cat /tmp/pr_only.txt
+else
+  cat /tmp/pr_raw.txt
+fi
+' 2>/dev/null
+}
+
+
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
